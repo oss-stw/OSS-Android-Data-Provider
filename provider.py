@@ -1,13 +1,14 @@
 """Prepare and publish data-only menu releases. Never builds or updates an APK."""
 from pathlib import Path
 import argparse
-import copy
+import concurrent.futures
 import hashlib
 import json
 import os
 import re
 import subprocess
 import tempfile
+import time
 import zipfile
 from datetime import datetime, timezone
 
@@ -49,6 +50,18 @@ def gh(*args, json_result=False):
     return json.loads(result.stdout) if json_result else result.stdout
 
 
+def release_by_tag(repository, tag):
+    # GitHub's tag endpoint does not resolve unpublished draft tags.
+    for attempt in range(5):
+        try:
+            item = gh("release", "view", tag, "--repo", repository, "--json", "databaseId", json_result=True)
+            return gh("api", f"repos/{repository}/releases/{item['databaseId']}", json_result=True)
+        except subprocess.CalledProcessError:
+            if attempt == 4:
+                raise
+            time.sleep(2)
+
+
 def publish(inventory, repository, output):
     """Reuse matching assets; never replace a historical menu with different bytes."""
     existing = gh("api", f"repos/{repository}/releases?per_page=100", "--paginate", "--slurp", json_result=True)
@@ -65,7 +78,7 @@ def publish(inventory, repository, output):
             raise ValueError("Unsupported existing catalog schema")
         catalog["menus"] = previous["menus"]
     indexed = {m["version"]: m for m in catalog["menus"]}
-    for record in inventory:
+    def upload_one(record):
         path = Path(record["path"])
         menu = inspect(path, repository, record["menu"]["channel"], record["menu"]["notes"])
         if menu != record["menu"]:
@@ -77,32 +90,35 @@ def publish(inventory, repository, output):
                 notes = Path(temporary) / "notes.txt"
                 notes.write_text(menu["notes"] or f"Menu v{menu['version']}", encoding="utf-8")
                 gh("release", "create", tag, "--repo", repository, "--draft", "--title", f"Menu v{menu['version']}", "--notes-file", str(notes))
-            release = gh("api", f"repos/{repository}/releases/tags/{tag}", json_result=True)
+            release = release_by_tag(repository, tag)
         asset = next((a for a in release["assets"] if a["name"] == path.name), None)
         if asset is None:
             gh("release", "upload", tag, str(path), "--repo", repository)
-            release = gh("api", f"repos/{repository}/releases/tags/{tag}", json_result=True)
+            release = gh("api", f"repos/{repository}/releases/{release['id']}", json_result=True)
             asset = next(a for a in release["assets"] if a["name"] == path.name)
         if asset["size"] != menu["zip"]["bytes"] or asset.get("digest") != "sha256:" + menu["zip"]["sha256"]:
             raise ValueError(f"Existing remote menu differs; preserved: {tag}")
         if release["draft"]:
             gh("release", "edit", tag, "--repo", repository, "--draft=false", "--latest=false", "--prerelease=" + str(menu["channel"] == "beta").lower())
         menu["zip"]["assetId"] = asset["id"]
-        indexed[menu["version"]] = menu
         print(f"Verified {tag}", flush=True)
+        return menu
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        for menu in executor.map(upload_one, inventory):
+            indexed[menu["version"]] = menu
     catalog["menus"] = sorted(indexed.values(), key=lambda m: tuple(map(int, m["version"].split("."))), reverse=True)
     payload = json.dumps(catalog, indent=2) + "\n"
     if len(payload.encode("utf-8")) > 1024 * 1024:
         raise ValueError("Catalog exceeds app limit; nothing published as latest")
     output.mkdir(parents=True, exist_ok=True)
     destination = output / "catalog.json"
-    destination.write_text(payload, encoding="utf-8")
+    destination.write_bytes(payload.encode("utf-8"))
     tag = "catalog-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
     with tempfile.TemporaryDirectory() as temporary:
         notes = Path(temporary) / "notes.txt"
         notes.write_text(f"{len(indexed)} downloadable menu versions. Refresh Menu library in OSS Android.", encoding="utf-8")
         gh("release", "create", tag, str(destination), "--repo", repository, "--draft", "--title", "Menu catalog", "--notes-file", str(notes))
-    release = gh("api", f"repos/{repository}/releases/tags/{tag}", json_result=True)
+    release = release_by_tag(repository, tag)
     asset = next(a for a in release["assets"] if a["name"] == "catalog.json")
     expected = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     if asset.get("digest") != "sha256:" + expected:
