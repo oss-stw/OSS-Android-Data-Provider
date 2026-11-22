@@ -105,8 +105,16 @@ def publish(inventory, repository, output):
         return menu
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         for menu in executor.map(upload_one, inventory):
+            previous=indexed.get(menu["version"], {})
+            if previous.get("files")==menu["files"] and previous.get("zip",{}).get("sha256")==menu["zip"]["sha256"]:
+                for key in ("patch","restore"):
+                    if key in previous:menu[key]=previous[key]
             indexed[menu["version"]] = menu
     catalog["menus"] = sorted(indexed.values(), key=lambda m: tuple(map(int, m["version"].split("."))), reverse=True)
+    publish_catalog(catalog, repository, output)
+
+
+def publish_catalog(catalog, repository, output):
     payload = json.dumps(catalog, indent=2) + "\n"
     if len(payload.encode("utf-8")) > 1024 * 1024:
         raise ValueError("Catalog exceeds app limit; nothing published as latest")
@@ -116,7 +124,7 @@ def publish(inventory, repository, output):
     tag = "catalog-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
     with tempfile.TemporaryDirectory() as temporary:
         notes = Path(temporary) / "notes.txt"
-        notes.write_text(f"{len(indexed)} downloadable menu versions. Refresh Menu library in OSS Android.", encoding="utf-8")
+        notes.write_text(f"{len(catalog['menus'])} downloadable menu versions. Refresh Menu library in OSS Android.", encoding="utf-8")
         gh("release", "create", tag, str(destination), "--repo", repository, "--draft", "--title", "Menu catalog", "--notes-file", str(notes))
     release = release_by_tag(repository, tag)
     asset = next(a for a in release["assets"] if a["name"] == "catalog.json")
@@ -124,7 +132,7 @@ def publish(inventory, repository, output):
     if asset.get("digest") != "sha256:" + expected:
         raise ValueError("Catalog upload did not verify; draft retained")
     gh("release", "edit", tag, "--repo", repository, "--draft=false", "--latest")
-    print(f"Published {len(indexed)} menus: https://github.com/{repository}/releases/tag/{tag}")
+    print(f"Published {len(catalog['menus'])} menus: https://github.com/{repository}/releases/tag/{tag}")
 
 
 def main():
