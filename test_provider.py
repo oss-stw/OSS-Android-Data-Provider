@@ -49,6 +49,31 @@ class ProviderTests(unittest.TestCase):
                 provider.publish([record], self.repo, self.root / "out")
             self.assertEqual(1, gh.call_count)
 
+    def test_draft_release_lookup_uses_database_id(self):
+        release = {"id": 42, "tag_name": "menu-v9.99", "draft": True}
+        with patch.object(provider, "gh", side_effect=[{"databaseId": 42}, release]) as gh:
+            self.assertEqual(release, provider.release_by_tag(self.repo, "menu-v9.99"))
+            self.assertEqual("release", gh.call_args_list[0].args[0])
+            self.assertEqual(f"repos/{self.repo}/releases/42", gh.call_args_list[1].args[1])
+
+    def test_published_catalog_hash_matches_exact_uploaded_bytes(self):
+        menu=provider.inspect(self.zip,self.repo)
+        release={"id":42,"tag_name":"menu-v9.99","draft":False,"assets":[{
+            "id":123,"name":self.zip.name,"size":self.zip.stat().st_size,"digest":"sha256:"+menu["zip"]["sha256"]}]}
+        output=self.root/"output"
+        def lookup(repository,tag):
+            data=(output/"catalog.json").read_bytes()
+            self.assertNotIn(b"\r\n",data)
+            self.assertEqual(123,json.loads(data)["menus"][0]["zip"]["assetId"])
+            return {"assets":[{"name":"catalog.json","digest":"sha256:"+hashlib.sha256(data).hexdigest()}]}
+        def call(*args,**kwargs):
+            if args[0]=="api":return [[release]]
+            return ""
+        with patch.object(provider,"gh",side_effect=call) as gh,patch.object(provider,"release_by_tag",side_effect=lookup):
+            provider.publish([{"path":str(self.zip),"menu":menu}],self.repo,output)
+            self.assertEqual(("release","edit"),gh.call_args_list[-1].args[:2])
+            self.assertIn("--latest",gh.call_args_list[-1].args)
+
 
 if __name__ == "__main__":
     unittest.main()
