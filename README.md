@@ -1,6 +1,8 @@
 # OSS Android Data Provider
 
 OSS Android reads `catalog.json` from this repository's latest GitHub release.
+Public catalogs and ZIPs use direct release download links without credentials or
+GitHub API quota. The initial supported app build is OSS Android 1.5.28.3.
 Every entry appears in Menu library, including historical and Beta versions.
 The app downloads the selected `menu_vX.Y.zip`, verifies its size and SHA-256,
 then verifies all three extracted archives before using the existing installation
